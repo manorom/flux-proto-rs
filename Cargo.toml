@@ -2,6 +2,10 @@
 name = "flux-proto"
 version = "0.1.0"
 edition = "2024"
+description = "Flux Resource Manager's message and RPC protocol in async Rust"
+authors = ["manorom <manorom@manorom.io>"]
+categories = ["network-programming"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["net", "rt", "macros", "io-util", "sync"] }
