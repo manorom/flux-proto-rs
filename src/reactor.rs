@@ -6,7 +6,6 @@ use crate::transport::{
     usock_transport,
 };
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 struct RouteTableInner {
@@ -53,7 +52,7 @@ impl RouteTable {
     }
 }
 
-pub(crate) enum ResponseChannel {
+enum ResponseChannel {
     Success(tokio::sync::oneshot::Sender<Result<(), Error>>),
     Single(tokio::sync::oneshot::Sender<Result<Response, Error>>),
     Streaming(tokio::sync::mpsc::UnboundedSender<Result<Response, Error>>),
