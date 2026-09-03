@@ -1,44 +1,41 @@
-use std::collections::BTreeSet;
-
-#[derive(Debug)]
 pub(crate) struct MatchTagPool {
-    avail_tags: BTreeSet<u32>,
-    max_tag: u32,
+    bitset: Vec<u32>,
 }
 
 impl MatchTagPool {
-    pub fn new(size: u32) -> Self {
+    pub fn new(size: u32) -> MatchTagPool {
         MatchTagPool {
-            avail_tags: BTreeSet::from_iter(1..=size),
-            max_tag: size,
+            bitset: vec![u32::MAX; size as usize],
         }
-    }
-    fn resize_pool(&mut self, new_size: u32) {
-        if new_size <= self.max_tag {
-            return; // We cannot make the pool any smaller, sorry
-        }
-
-        self.avail_tags.extend(self.max_tag + 1..=new_size);
-        self.max_tag = new_size;
     }
     pub fn alloc_tag(&mut self) -> u32 {
-        if self.avail_tags.is_empty() {
-            let new_size = self.max_tag.saturating_mul(2);
-            self.resize_pool(new_size);
+        let mut vidx = 0;
+        loop {
+            if self.bitset.len() <= vidx {
+                self.bitset.push(u32::MAX);
+            }
+            if let Some(new_tag) = self.bitset[vidx].lowest_one() {
+                // set to zero -> tag used
+                self.bitset[vidx] &= !(1 << new_tag);
+                return (vidx as u32 * 32 + new_tag) + 1;
+            }
+            vidx += 1;
         }
-
-        self.avail_tags
-            .take(&self.avail_tags.first().copied().unwrap())
-            .unwrap()
     }
     pub fn free_tag(&mut self, tag: u32) {
-        if tag == 0 || tag > self.max_tag {
-            panic!("Trying to free invalid match tag");
+        let tag = tag.checked_sub(1).expect("invalid match tag");
+        let vidx = tag.div_euclid(32);
+        let sub_tag = tag.rem_euclid(32);
+        let elem = self
+            .bitset
+            .get_mut(vidx as usize)
+            .expect("invalid match tag");
+        let bit = 1 << sub_tag;
+        if *elem & bit != 0 {
+            // the tag is already freed, panic
+            panic!("double free");
         }
-
-        if !self.avail_tags.insert(tag) {
-            panic!("Double free of match tag {}", tag);
-        }
+        *elem |= bit;
     }
 }
 
@@ -65,24 +62,24 @@ mod tests {
         pool.free_tag(t1);
         pool.free_tag(t2);
 
-        // Since this is a BTreeSet, it should return the smallest available
         assert_eq!(pool.alloc_tag(), t1);
         assert_eq!(pool.alloc_tag(), t2);
     }
 
     #[test]
     fn grows_when_exhausted() {
-        let mut pool = MatchTagPool::new(2);
+        let mut pool = MatchTagPool::new(1);
 
-        assert_eq!(pool.alloc_tag(), 1);
-        assert_eq!(pool.alloc_tag(), 2);
+        for t1 in 1..=32 {
+            assert_eq!(pool.alloc_tag(), t1);
+        }
 
-        // Should trigger resize to 4
+        // Should trigger resize
+        let t2 = pool.alloc_tag();
         let t3 = pool.alloc_tag();
-        let t4 = pool.alloc_tag();
 
-        assert_eq!(t3, 3);
-        assert_eq!(t4, 4);
+        assert_eq!(t2, 33);
+        assert_eq!(t3, 34);
     }
 
     #[test]
@@ -90,16 +87,16 @@ mod tests {
         let mut pool = MatchTagPool::new(1);
 
         let mut tags = Vec::new();
-        for _ in 0..10 {
+        for _ in 1..=128 {
             tags.push(pool.alloc_tag());
         }
 
         // Should allocate sequentially
-        assert_eq!(tags, (1..=10).collect::<Vec<_>>());
+        assert_eq!(tags, (1..=128).collect::<Vec<_>>());
     }
 
     #[test]
-    #[should_panic(expected = "Double free")]
+    #[should_panic(expected = "double free")]
     fn double_free_panics() {
         let mut pool = MatchTagPool::new(2);
 
