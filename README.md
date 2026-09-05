@@ -1,6 +1,6 @@
 # Flux-Proto
 
-An native Rust implementation of [FLux Resource Manager's](https://github.com/flux-framework/flux-core) message and RPC protocol, using `async/await` and the Tokio runtime. 
+An native Rust implementation of [Flux Resource Manager's](https://github.com/flux-framework/flux-core) message and RPC protocol, using `async/await` and the Tokio runtime. 
 
 This crate aims to provide a Rust API to interact with a (local) Flux broker without using `libflux`.
 Re-implementing the Flux message and RPC protocol in pure Rust, without relying on `libflux` and it's libev-based IO runtime, enables the use of `async/await` code with Tokio and it's rich ecosystem 
