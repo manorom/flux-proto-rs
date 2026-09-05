@@ -1,6 +1,6 @@
 // Utilities implementing the Request/Response logic on top of the messages from
 // `crate::transport`.
-use crate::transport::{Frame, MessageHeader, RawMessage};
+use crate::transport::Frame;
 
 pub trait IntoPayload {
     fn into_payload(self) -> Option<Frame>;
@@ -36,25 +36,6 @@ impl IntoTopic for &str {
     }
 }
 
-pub(crate) fn request_message(
-    nodeid: u32,
-    matchtag: Option<u32>,
-    topic: impl IntoTopic,
-    payload: impl IntoPayload,
-    upstream_flag: bool,
-) -> RawMessage {
-    let topic = topic.into_topic();
-    let payload = payload.into_payload();
-    let header = MessageHeader::new_request(nodeid, matchtag, payload.is_some(), upstream_flag);
-    let mut frames = Vec::new();
-    // route delimiter
-    frames.push(Vec::new());
-    frames.push(topic);
-    if let Some(payload) = payload {
-        frames.push(payload)
-    }
-    (header, frames)
-}
 
 #[derive(Debug)]
 pub struct Response {
