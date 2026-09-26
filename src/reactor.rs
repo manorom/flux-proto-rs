@@ -1,11 +1,11 @@
 use crate::error::Error;
 use crate::rpc::{Response, ResponseChannel, ResponseRouter, new_request};
-use crate::transport::{IntoPayload, IntoTopic, RawMessage, usock_transport};
+use crate::transport::{IntoPayload, IntoTopic, Message, usock_transport};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
 
-struct SendRequest(RawMessage, oneshot::Sender<Result<(), Error>>);
+struct SendRequest(Message, oneshot::Sender<Result<(), Error>>);
 
 type SendQueueTx = mpsc::UnboundedSender<SendRequest>;
 type SendQueueRx = mpsc::UnboundedReceiver<SendRequest>;

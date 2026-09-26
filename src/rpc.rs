@@ -3,7 +3,7 @@ use crate::{IntoPayload, IntoTopic};
 // `crate::transport`.
 use crate::error::Error;
 use crate::match_tag::MatchTagPool;
-use crate::transport::{MessageHeader, RawMessage};
+use crate::transport::{MessageHeader, Message};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -108,7 +108,7 @@ pub(crate) fn new_request(
     route_upstream: bool,
     topic: impl IntoTopic,
     payload: impl IntoPayload,
-) -> RawMessage {
+) -> Message {
     let topic = topic.into_topic();
     let payload = payload.into_payload();
 

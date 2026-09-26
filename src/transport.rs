@@ -3,6 +3,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub type Frame = Vec<u8>;
 
+pub type Message = (MessageHeader, Vec<Frame>);
+
 pub trait IntoPayload {
     fn into_payload(self) -> Option<Frame>;
 }
@@ -215,10 +217,8 @@ impl MessageHeader {
     }
 }
 
-pub(crate) type RawMessage = (MessageHeader, Vec<Frame>);
-
 pub(crate) trait TransportReceive {
-    async fn receive_message(&mut self) -> Result<RawMessage, Error>;
+    async fn receive_message(&mut self) -> Result<Message, Error>;
 }
 
 pub(crate) trait TransportSend {
@@ -235,7 +235,7 @@ mod usock {
     pub struct UsockTransportReceive(tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>);
 
     impl TransportReceive for UsockTransportReceive {
-        async fn receive_message(&mut self) -> Result<RawMessage, Error> {
+        async fn receive_message(&mut self) -> Result<Message, Error> {
             let total_message_size = self.receive_transport_header().await?;
 
             let mut received_size = 0;
