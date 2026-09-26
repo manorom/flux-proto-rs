@@ -5,5 +5,5 @@ mod rpc;
 mod transport;
 
 pub use error::Error;
-pub use reactor::Reactor;
+pub use reactor::{FluxHandle, Reactor};
 pub use rpc::{IntoPayload, IntoTopic, Response};

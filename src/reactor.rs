@@ -1,216 +1,92 @@
 use crate::error::Error;
-use crate::match_tag::MatchTagPool;
-use crate::rpc::{IntoPayload, IntoTopic, Response};
-use crate::transport::{
-    MessageHeader, TransportReceive, TransportSend, UsockTransportReceive, UsockTransportSend,
-    usock_transport,
-};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use crate::rpc::{IntoPayload, IntoTopic, Response, ResponseChannel, ResponseRouter};
+use crate::transport::{MessageHeader, RawMessage, usock_transport};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task;
 
-struct RouteTableInner {
-    routes: HashMap<u32, ResponseChannel>,
-    tag_pool: MatchTagPool,
-}
+struct SendRequest(RawMessage, oneshot::Sender<Result<(), Error>>);
 
-#[derive(Clone)]
-struct RouteTable(Arc<Mutex<RouteTableInner>>);
-
-impl RouteTable {
-    fn new(pool_size: u32) -> RouteTable {
-        Self(Arc::new(Mutex::new(RouteTableInner {
-            routes: HashMap::new(),
-            tag_pool: MatchTagPool::new(pool_size),
-        })))
-    }
-    fn add_route(&self, channel: ResponseChannel) -> u32 {
-        let mut inner = self.0.lock().unwrap();
-        let new_tag = inner.tag_pool.alloc_tag();
-        inner.routes.insert(new_tag, channel);
-        new_tag
-    }
-    fn get_route(&self, tag: u32, keep_streaming: bool) -> Option<ResponseChannel> {
-        let mut inner = self.0.lock().unwrap();
-        let channel = inner.routes.remove(&tag)?;
-        if keep_streaming {
-            match channel {
-                ResponseChannel::Streaming(sender) => {
-                    inner
-                        .routes
-                        .insert(tag, ResponseChannel::Streaming(sender.clone()));
-                    Some(ResponseChannel::Streaming(sender))
-                }
-                channel => {
-                    inner.tag_pool.free_tag(tag);
-                    Some(channel)
-                }
-            }
-        } else {
-            inner.tag_pool.free_tag(tag);
-            Some(channel)
-        }
-    }
-}
-
-enum ResponseChannel {
-    Success(tokio::sync::oneshot::Sender<Result<(), Error>>),
-    Single(tokio::sync::oneshot::Sender<Result<Response, Error>>),
-    Streaming(tokio::sync::mpsc::UnboundedSender<Result<Response, Error>>),
-}
-
-impl ResponseChannel {
-    fn signal_error(self, error: Error) {
-        match self {
-            ResponseChannel::Success(sender) => {
-                let _ = sender.send(Err(error));
-            }
-            ResponseChannel::Single(sender) => {
-                let _ = sender.send(Err(error));
-            }
-            ResponseChannel::Streaming(unbounded_sender) => {
-                let _ = unbounded_sender.send(Err(error));
-            }
-        }
-    }
-    fn response(self, errnum: u32, topic: Vec<u8>, payload: Vec<u8>) {
-        match self {
-            Self::Success(..) => (),
-            Self::Single(sender) => {
-                let _ = sender.send(Ok(Response::new(errnum, topic, Some(payload))));
-            }
-            Self::Streaming(sender) => {
-                let _ = sender.send(Ok(Response::new(errnum, topic, Some(payload))));
-            }
-        }
-    }
-}
-
-struct ReactorRequest {
-    nodeid: u32,
-    topic: Vec<u8>,
-    payload: Option<Vec<u8>>,
-    route_upstream: bool,
-    response: ResponseChannel,
-}
-
-impl ReactorRequest {
-    fn message_header(&self, matchtag: Option<u32>) -> MessageHeader {
-        MessageHeader::new_request(
-            self.nodeid,
-            matchtag,
-            self.payload.is_some(),
-            self.route_upstream,
-        )
-    }
-}
+type SendQueueTx = mpsc::UnboundedSender<SendRequest>;
+type SendQueueRx = mpsc::UnboundedReceiver<SendRequest>;
 
 mod reactor_impl {
-    use super::*;
+    use super::SendQueueRx;
+    use crate::{
+        reactor::SendRequest,
+        rpc::ResponseRouter,
+        transport::{TransportReceive, TransportSend, UsockTransportReceive, UsockTransportSend},
+    };
+    use std::sync::Arc;
 
-    pub(super) async fn start_receiving(
-        transport_rx: UsockTransportReceive,
-        recv_table: RouteTable,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut transport_rx = transport_rx;
-            let recv_table = recv_table;
-
-            while let Ok((msg_header, mut msg_frames)) = transport_rx.receive_message().await {
-                if let Some((errno, matchtag)) = msg_header.is_response() {
-                    // dispatch response
-                    // get_route will automatically free the matchtag, unless it is a streaming response
-                    let response_channel_sender = recv_table.get_route(matchtag, true);
-                    if let Some(sender) = response_channel_sender {
-                        // TODO: destructure with error checking
-                        let payload = msg_frames.pop().unwrap();
-                        let topic = msg_frames.pop().unwrap();
-                        sender.response(errno, topic, payload);
-                    }
+    pub(crate) async fn send_task(
+        mut send_queue_rx: SendQueueRx,
+        mut transport_tx: UsockTransportSend,
+    ) {
+        while let Some(send) = send_queue_rx.recv().await {
+            let SendRequest(raw_msg, result_channel) = send;
+            let (header, frames) = raw_msg;
+            match transport_tx.send_message(&header, &frames).await {
+                Ok(()) => {
+                    let _ = result_channel.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = result_channel.send(Err(e));
                 }
             }
-        })
-    }
-
-    pub(super) async fn start_sending(
-        send_queue_rx: tokio::sync::mpsc::UnboundedReceiver<ReactorRequest>,
-        transport_tx: UsockTransportSend,
-        recv_table: RouteTable,
-    ) -> tokio::task::JoinHandle<()> {
-        enum ResponseHandle {
-            Matchtag(u32),
-            SuccessChannel(tokio::sync::oneshot::Sender<Result<(), Error>>),
         }
+    }
+    pub(crate) async fn recv_task(
+        response_router: Arc<ResponseRouter>,
+        mut transport_rx: UsockTransportReceive,
+    ) {
+        while let Ok(recv) = transport_rx.receive_message().await {
+            let (header, mut frames) = recv;
+            let Some((errnum, matchtag)) = header.is_response() else {
+                continue;
+            };
 
-        tokio::spawn(async move {
-            let recv_table = recv_table;
-            let mut send_queue_rx = send_queue_rx;
-            let mut transport_tx = transport_tx;
+            let Some(response_channel) = response_router.get_route(matchtag, false) else {
+                continue;
+            };
 
-            while let Some(raw_request) = send_queue_rx.recv().await {
-                let mut header = raw_request.message_header(None); // we set the matchtag later
-                let response_channel_writer = raw_request.response;
-                let topic_frame = raw_request.topic;
-                let payload_frame = raw_request.payload;
-                let mut frames = vec![Vec::new(), topic_frame];
-                if let Some(payload_frame) = payload_frame {
-                    frames.push(payload_frame);
-                }
+            let payload = frames.pop().unwrap();
+            let topic = frames.pop().unwrap();
 
-                let response_handle =
-                    if let ResponseChannel::Success(channel) = response_channel_writer {
-                        ResponseHandle::SuccessChannel(channel)
-                    } else {
-                        let matchtag = recv_table.add_route(response_channel_writer);
-                        header.set_matchtag(matchtag);
-                        ResponseHandle::Matchtag(matchtag)
-                    };
-
-                if let Err(e) = transport_tx.send_message(&header, &frames).await {
-                    match response_handle {
-                        ResponseHandle::Matchtag(matchtag) => {
-                            if let Some(channel) = recv_table.get_route(matchtag, false) {
-                                channel.signal_error(e);
-                            }
-                        }
-                        ResponseHandle::SuccessChannel(channel) => {
-                            let _ = channel.send(Err(e)); // if the sending task does no longer care about the result, that's their problem
-                        }
-                    }
-                } else if let ResponseHandle::SuccessChannel(channel) = response_handle {
-                    let _ = channel.send(Ok(()));
-                }
-            }
-        })
+            response_channel.response(errnum, topic, payload);
+        }
     }
 }
 
-type SendQueueSender = tokio::sync::mpsc::UnboundedSender<ReactorRequest>;
-
 pub struct Reactor {
-    send_queue_sender: SendQueueSender,
+    send_queue_tx: SendQueueTx,
+    response_router: Arc<ResponseRouter>, // Arc<Arc<Arc<...
     sender_task: tokio::task::JoinHandle<()>,
     receiver_task: tokio::task::JoinHandle<()>,
 }
 
 impl Reactor {
-    pub async fn run_connect_local(flux_uri: &str) -> Result<Reactor, Error> {
-        let (send_queue_sender, send_queue_receiver) =
-            tokio::sync::mpsc::unbounded_channel::<ReactorRequest>();
-        let recv_table = RouteTable::new(8);
+    pub async fn with_local(flux_uri: &str) -> Result<Arc<Self>, Error> {
+        let (send_queue_tx, send_queue_rx) = mpsc::unbounded_channel::<SendRequest>();
+        let response_router = Arc::new(ResponseRouter::new(1));
         let (transport_tx, transport_rx) = usock_transport(flux_uri).await?;
 
-        let receiver_task = reactor_impl::start_receiving(transport_rx, recv_table.clone()).await;
-        let sender_task =
-            reactor_impl::start_sending(send_queue_receiver, transport_tx, recv_table).await;
+        let receiver_task = task::spawn({
+            let response_router = response_router.clone();
+            async move {
+                reactor_impl::recv_task(response_router, transport_rx).await;
+            }
+        });
+        let sender_task = task::spawn(async move {
+            reactor_impl::send_task(send_queue_rx, transport_tx).await;
+        });
 
-        Ok(Reactor {
-            send_queue_sender,
+        Ok(Arc::new(Self {
+            send_queue_tx,
+            response_router,
             sender_task,
             receiver_task,
-        })
-    }
-    pub fn handle(&self) -> FluxHandle {
-        FluxHandle(self.send_queue_sender.clone())
+        }))
     }
 }
 
@@ -222,9 +98,13 @@ impl Drop for Reactor {
 }
 
 #[derive(Clone)]
-pub struct FluxHandle(SendQueueSender);
+pub struct FluxHandle(Arc<Reactor>);
 
 impl FluxHandle {
+    pub async fn connect_local(flux_uri: &str) -> Result<Self, Error> {
+        Ok(FluxHandle(Reactor::with_local(flux_uri).await?))
+    }
+
     pub async fn request(
         &self,
         nodeid: u32,
@@ -232,20 +112,28 @@ impl FluxHandle {
         payload: impl IntoPayload,
         route_upstream: bool,
     ) -> Result<(), Error> {
-        let (response_channel_sender, response_channel_receiver) = tokio::sync::oneshot::channel();
-        self.0
-            .send(ReactorRequest {
-                nodeid,
-                topic: topic.into_topic(),
-                payload: payload.into_payload(),
-                route_upstream,
-                response: ResponseChannel::Success(response_channel_sender),
-            })
-            .expect("Trying to send message with stopped reactor");
+        let (result_tx, result_rx) = oneshot::channel();
 
-        response_channel_receiver
-            .await
-            .expect("Reactor terminated wth sent messages pending")
+        let topic = topic.into_topic();
+        let payload = payload.into_payload();
+
+        let header = MessageHeader::new_request(nodeid, None, payload.is_some(), route_upstream);
+        let mut additional_frames = Vec::with_capacity(3);
+        additional_frames.push(Vec::new());
+        additional_frames.push(topic);
+        if let Some(payload) = payload {
+            additional_frames.push(payload);
+        }
+
+        self.0
+            .send_queue_tx
+            .send(SendRequest((header, additional_frames), result_tx))
+            .map_err(|_| Error::ReactorShutdown)?;
+
+        // One might question the wisdom of waiting here...
+        result_rx.await.map_err(|_e| Error::ReactorShutdown)??;
+
+        Ok(())
     }
 
     pub async fn request_with_response(
@@ -255,19 +143,39 @@ impl FluxHandle {
         payload: impl IntoPayload,
         route_upstream: bool,
     ) -> Result<Response, Error> {
-        let (response_channel_sender, response_channel_receiver) = tokio::sync::oneshot::channel();
-        self.0
-            .send(ReactorRequest {
-                nodeid,
-                topic: topic.into_topic(),
-                payload: payload.into_payload(),
-                route_upstream,
-                response: ResponseChannel::Single(response_channel_sender),
-            })
-            .expect("Trying to send message with stopped reactor");
+        let (result_tx, result_rx) = oneshot::channel();
+        let (response_tx, response_rx) = oneshot::channel();
 
-        response_channel_receiver
+        let matchtag = self
+            .0
+            .response_router
+            .new_route(ResponseChannel::Response(response_tx));
+
+        let topic = topic.into_topic();
+        let payload = payload.into_payload();
+
+        let header =
+            MessageHeader::new_request(nodeid, Some(matchtag), payload.is_some(), route_upstream);
+        let mut additional_frames = Vec::with_capacity(3);
+        additional_frames.push(Vec::new());
+        additional_frames.push(topic);
+        if let Some(payload) = payload {
+            additional_frames.push(payload);
+        }
+
+        self.0
+            .send_queue_tx
+            .send(SendRequest((header, additional_frames), result_tx))
+            .map_err(|_| Error::ReactorShutdown)?;
+
+        if let Err(e) = result_rx.await.map_err(|_| Error::ReactorShutdown) {
+            self.0.response_router.remove_route(matchtag);
+            return Err(e);
+        }
+
+        response_rx
             .await
-            .expect("Reactor terminated with sent messages pending")
+            .map_err(|_| Error::ReactorShutdown)
+            .flatten()
     }
 }

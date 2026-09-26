@@ -1,5 +1,6 @@
 #[derive(Debug)]
 pub enum Error {
+    ReactorShutdown,
     DecodeError,
     PermissionDenied(u8),
     Connection(tokio::io::Error),
@@ -10,6 +11,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ReactorShutdown => write!(f, "The reactor was terminated"),
             Self::DecodeError => write!(f, "Could not decode Transport Header"),
             Self::PermissionDenied(errno) => {
                 write!(f, "Permission denied by broker, errno={}", errno)
