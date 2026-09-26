@@ -3,6 +3,40 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub type Frame = Vec<u8>;
 
+pub trait IntoPayload {
+    fn into_payload(self) -> Option<Frame>;
+}
+
+impl IntoPayload for () {
+    fn into_payload(self) -> Option<Frame> {
+        None
+    }
+}
+
+impl IntoPayload for Vec<u8> {
+    fn into_payload(self) -> Option<Frame> {
+        Some(self)
+    }
+}
+
+impl IntoPayload for Option<Vec<u8>> {
+    fn into_payload(self) -> Option<Frame> {
+        self
+    }
+}
+
+pub trait IntoTopic {
+    fn into_topic(self) -> Frame;
+}
+
+impl IntoTopic for &str {
+    fn into_topic(self) -> Frame {
+        let mut topic = Vec::from(self.as_bytes());
+        topic.push(b'\0');
+        topic
+    }
+}
+
 pub struct MessageHeader {
     version: u8,
     flags: u8,
