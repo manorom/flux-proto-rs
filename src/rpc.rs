@@ -1,7 +1,9 @@
+use crate::{IntoPayload, IntoTopic};
 // Utilities implementing the Request/Response logic on top of the messages from
 // `crate::transport`.
 use crate::error::Error;
 use crate::match_tag::MatchTagPool;
+use crate::transport::{MessageHeader, RawMessage};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -62,13 +64,13 @@ impl ResponseChannel {
             }
         }
     }
-    pub(crate) fn response(self, errnum: u32, topic: Vec<u8>, payload: Vec<u8>) {
+    pub(crate) fn response(self, errnum: u32, topic: Vec<u8>, payload: Option<Vec<u8>>) {
         match self {
             Self::Response(sender) => {
-                let _ = sender.send(Ok(Response::new(errnum, topic, Some(payload))));
+                let _ = sender.send(Ok(Response::new(errnum, topic, payload)));
             }
             Self::StreamingResponse(sender) => {
-                let _ = sender.send(Ok(Response::new(errnum, topic, Some(payload))));
+                let _ = sender.send(Ok(Response::new(errnum, topic, payload)));
             }
         }
     }
@@ -98,4 +100,24 @@ impl Response {
     pub fn payload_raw(&self) -> Option<&[u8]> {
         self.payload.as_deref()
     }
+}
+
+pub(crate) fn new_request(
+    nodeid: u32,
+    matchtag: Option<u32>,
+    route_upstream: bool,
+    topic: impl IntoTopic,
+    payload: impl IntoPayload,
+) -> RawMessage {
+    let topic = topic.into_topic();
+    let payload = payload.into_payload();
+
+    let header = MessageHeader::new_request(nodeid, matchtag, payload.is_some(), route_upstream);
+    let mut additional_frames = Vec::with_capacity(3);
+    additional_frames.push(Vec::new());
+    additional_frames.push(topic);
+    if let Some(payload) = payload {
+        additional_frames.push(payload);
+    }
+    (header, additional_frames)
 }

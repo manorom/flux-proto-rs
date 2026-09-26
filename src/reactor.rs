@@ -1,6 +1,6 @@
 use crate::error::Error;
-use crate::rpc::{Response, ResponseChannel, ResponseRouter};
-use crate::transport::{IntoPayload, IntoTopic, MessageHeader, RawMessage, usock_transport};
+use crate::rpc::{Response, ResponseChannel, ResponseRouter, new_request};
+use crate::transport::{IntoPayload, IntoTopic, RawMessage, usock_transport};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task;
@@ -50,7 +50,11 @@ mod reactor_impl {
                 continue;
             };
 
-            let payload = frames.pop().unwrap();
+            let payload = if header.has_payload() {
+                frames.pop()
+            } else {
+                None
+            };
             let topic = frames.pop().unwrap();
 
             response_channel.response(errnum, topic, payload);
@@ -114,20 +118,11 @@ impl FluxHandle {
     ) -> Result<(), Error> {
         let (result_tx, result_rx) = oneshot::channel();
 
-        let topic = topic.into_topic();
-        let payload = payload.into_payload();
-
-        let header = MessageHeader::new_request(nodeid, None, payload.is_some(), route_upstream);
-        let mut additional_frames = Vec::with_capacity(3);
-        additional_frames.push(Vec::new());
-        additional_frames.push(topic);
-        if let Some(payload) = payload {
-            additional_frames.push(payload);
-        }
+        let msg = new_request(nodeid, None, route_upstream, topic, payload);
 
         self.0
             .send_queue_tx
-            .send(SendRequest((header, additional_frames), result_tx))
+            .send(SendRequest(msg, result_tx))
             .map_err(|_| Error::ReactorShutdown)?;
 
         // One might question the wisdom of waiting here...
@@ -151,21 +146,11 @@ impl FluxHandle {
             .response_router
             .new_route(ResponseChannel::Response(response_tx));
 
-        let topic = topic.into_topic();
-        let payload = payload.into_payload();
-
-        let header =
-            MessageHeader::new_request(nodeid, Some(matchtag), payload.is_some(), route_upstream);
-        let mut additional_frames = Vec::with_capacity(3);
-        additional_frames.push(Vec::new());
-        additional_frames.push(topic);
-        if let Some(payload) = payload {
-            additional_frames.push(payload);
-        }
+        let msg = new_request(nodeid, Some(matchtag), route_upstream, topic, payload);
 
         self.0
             .send_queue_tx
-            .send(SendRequest((header, additional_frames), result_tx))
+            .send(SendRequest(msg, result_tx))
             .map_err(|_| Error::ReactorShutdown)?;
 
         if let Err(e) = result_rx.await.map_err(|_| Error::ReactorShutdown) {
